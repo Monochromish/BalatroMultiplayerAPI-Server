@@ -24,7 +24,7 @@ import type {
 	ActionSkip,
 	ActionSpentLastShop,
 	ActionStartAnteTimer,
-	ActionPauseAnteTimer,
+	ActionPauseAnteTimerRequest,
 	ActionSyncClient,
 	ActionSubmitLogHashes,
 	ActionStreamLogLines,
@@ -438,7 +438,7 @@ const server = createServer((socket) => {
 						break
 					case 'pauseAnteTimer':
 						actionHandlers.pauseAnteTimer(
-							actionArgs as ActionHandlerArgs<ActionPauseAnteTimer>,
+							actionArgs as ActionHandlerArgs<ActionPauseAnteTimerRequest>,
 							client,
 						)
 						break
@@ -624,16 +624,15 @@ const sendToTargets = (
 
 		if (is_host === true) {
 			if (lobby.host) { lobby.host.sendAction(action); recipients++ }
-		} else if (is_host === false) {
-			if (lobby.guest) { lobby.guest.sendAction(action); recipients++ }
 		} else {
-			if (lobby.host) { lobby.host.sendAction(action); recipients++ }
-			if (lobby.guest) { lobby.guest.sendAction(action); recipients++ }
+			for (const player of lobby.players) {
+				if (is_host === false && player === lobby.host) continue
+				player.sendAction(action); recipients++
+			}
 		}
 	} else {
 		for (const lobby of Lobbies.values()) {
-			if (lobby.host) { lobby.host.sendAction(action); recipients++ }
-			if (lobby.guest) { lobby.guest.sendAction(action); recipients++ }
+			for (const player of lobby.players) { player.sendAction(action); recipients++ }
 		}
 	}
 

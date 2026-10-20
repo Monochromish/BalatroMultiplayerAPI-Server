@@ -1,7 +1,7 @@
 import type Client from "./Client.js";
 import GameModes from "./GameMode.js";
 import { InsaneInt } from "./InsaneInt.js";
-import Lobby, { getEnemy } from "./Lobby.js";
+import Lobby, { MAX_PLAYERS, getEnemy } from "./Lobby.js";
 import type {
 	ActionCreateLobby,
 	ActionEatPizza,
@@ -23,7 +23,7 @@ import type {
 	ActionSkip,
 	ActionSpentLastShop,
 	ActionStartAnteTimer,
-	ActionPauseAnteTimer,
+	ActionPauseAnteTimerRequest,
 	ActionSyncClient,
 	ActionSubmitLogHashes,
 	ActionStreamLogLines,
@@ -38,6 +38,7 @@ import type {
 	ActionHandyMPExtensionEnable,
 	ActionHandyMPExtensionDisable,
     ActionDataSyncRequest,
+	ActionServerToClient,
 } from "./actions.js";
 import { generateSeed } from "./utils.js";
 import {
@@ -50,9 +51,11 @@ import {
 const TCG_SERVER_VERSION = 1;
 
 const usernameAction = (
-	{ username, modHash }: ActionHandlerArgs<ActionUsername>,
+	{ username, modHash, maxPlayers }: ActionHandlerArgs<ActionUsername>,
 	client: Client,
 ) => {
+	const supported = Math.floor(Number(maxPlayers));
+	if (supported >= 2) client.maxPlayers = Math.min(supported, MAX_PLAYERS);
 	client.setUsername(username);
 	client.setModHash(modHash);
 };
@@ -136,6 +139,9 @@ const startGameAction = (client: Client) => {
 	if (!lobby || lobby.host?.id !== client.id) {
 		return;
 	}
+	if (lobby.players.length < 2 || (lobby.isInGame && !lobby.matchOver)) {
+		return;
+	}
 
 	// Only start the game if guest is ready
 	// TODO: Uncomment this when Client ready is released in the mod
@@ -155,63 +161,48 @@ const startGameAction = (client: Client) => {
 	lobby.resetPlayers();
 
 	lobby.isInGame = true;
+	lobby.multi = lobby.players.length > 2;
 	lobby.broadcastAction({
 		action: "startGame",
 		deck: "c_multiplayer_1",
 		seed,
+		...(lobby.multi ? { playerCount: lobby.players.length } : {}),
 	});
 
 	// Reset players' lives
 	lobby.setPlayersLives(lives);
 
-	// Unready guest for next game
-	if (lobby.guest) {
-		lobby.guest.isReadyLobby = false;
+	// Unready guests for next game
+	for (const player of lobby.players) {
+		if (player !== lobby.host) player.isReadyLobby = false;
 	}
+	lobby.broadcastPlayersInfo();
 };
 
 const readyBlindAction = (client: Client) => {
+	if (client.eliminated) return;
 	client.isReady = true;
+	client.readyAt = Date.now();
 
-	const [lobby, enemy] = getEnemy(client);
+	const lobby = client.lobby;
+	if (lobby) lobby.clearTimers(client);
+	else client.timeredBy.clear();
+	const opponents = lobby?.getOpponents(client) ?? [];
 
-	if (!client.firstReady && !enemy?.isReady && !enemy?.firstReady) {
+	// Readying while the others still play a PvP blind (after losing it on the
+	// timer) is settled when that blind ends
+	if (
+		!lobby?.pvpActive &&
+		!client.firstReady &&
+		!opponents.some((p) => p.isReady || p.firstReady)
+	) {
 		client.firstReady = true;
 		if (lobby) lobby.firstReadyAt = Date.now();
 		client.sendAction({ action: "speedrun" });
 	}
 
-	// TODO: Refactor for more than two players
-	if (client.lobby?.host?.isReady && client.lobby.guest?.isReady) {
-		// Grant speedrun to second player if within 30s of the first
-		if (lobby?.firstReadyAt && (Date.now() - lobby.firstReadyAt) <= 30000) {
-			client.sendAction({ action: "speedrun" });
-		}
-		lobby!.firstReadyAt = null;
-
-		// Reset ready status for next blind
-		client.lobby.host.isReady = false;
-		client.lobby.guest.isReady = false;
-
-		// Reset scores for next blind
-		client.lobby.host.score = new InsaneInt(0, 0, 0);
-		client.lobby.guest.score = new InsaneInt(0, 0, 0);
-
-		// Reset hands left for next blind
-		client.lobby.host.handsLeft = 4;
-		client.lobby.guest.handsLeft = 4;
-
-		// Reset per-blind hand-played gate so opponent scores are withheld
-		// again at the start of each blind
-		client.lobby.host.playedThisBlind = false;
-		client.lobby.guest.playedThisBlind = false;
-
-        let firstPlayer: "host" | "guest" | undefined
-        if (client.lobby.host.firstReady) firstPlayer = "host"
-        if (client.lobby.guest.firstReady) firstPlayer = "guest"
-
-		client.lobby.broadcastAction({ action: "startBlind", firstPlayer });
-	}
+	lobby?.checkAllReady(client);
+	lobby?.broadcastPlayersInfo();
 };
 
 const unreadyBlindAction = (client: Client) => {
@@ -222,17 +213,15 @@ const playHandAction = (
 	{ handsLeft, score }: ActionHandlerArgs<ActionPlayHand>,
 	client: Client,
 ) => {
-	const [lobby, enemy] = getEnemy(client);
+	const lobby = client.lobby;
 
-	if (
-		lobby === null ||
-		enemy === null ||
-		lobby.host === null ||
-		lobby.guest === null
-	) {
+	if (lobby === null || lobby.players.length < 2) {
 		stopGameAction(client);
 		return;
 	}
+	if (client.eliminated || lobby.matchOver) return;
+	// Lost this PvP blind on the timer: the score stays frozen until it ends
+	if (lobby.pvpActive && client.pvpResolved) return;
 
 	client.score = InsaneInt.fromString(String(score));
 
@@ -240,10 +229,6 @@ const playHandAction = (
 		typeof handsLeft === "number" ? handsLeft : Number(handsLeft);
 	client.handsLeft = Math.floor(client.handsLeft);
 
-	// Lobby option, default OFF: the client only enables it for standard-layer
-	// rulesets (and sends it explicitly), so gate only when it's truthy. Absent
-	// (old clients / non-standard rulesets) means the original immediate relay.
-	const hideScore = Boolean(lobby.options.hide_score_until_played);
 	// A bootstrap play emitted at blind start reports score 0 (no hand actually
 	// committed). A real hand always scores > 0, so use that to decide whether the
 	// player has genuinely played this blind. Hand counts can vary in this game, so
@@ -251,151 +236,45 @@ const playHandAction = (
 	const playedRealHand = client.score.greaterThan(new InsaneInt(0, 0, 0));
 	if (playedRealHand) client.playedThisBlind = true;
 
-    const isHostTurn = lobby.host.score.equalTo(lobby.guest.score) ? lobby.host.firstReady : lobby.host.score.greaterThan(lobby.guest.score)
+	// Reveal our score to the opponents immediately, unless the lobby option
+	// hide_score_until_played (default OFF; only standard-layer rulesets send
+	// it) withholds it until they have also committed a hand this blind. On our
+	// first real hand we also get their scores that were withheld from us.
+	for (const opponent of lobby.getOpponents(client)) lobby.sendPvPEnemyInfo(opponent);
+	lobby.sendPvPEnemyInfo(client);
+	lobby.broadcastPlayersInfo();
 
-	// Reveal our score to the enemy immediately, unless we're withholding it
-	// until they have also committed a hand this blind. This stops a player from
-	// watching the opponent's score before playing their own hand.
-	if (!hideScore || enemy.playedThisBlind) {
-		enemy.sendAction({
-			action: "enemyInfo",
-			handsLeft,
-			score: client.score.toString(),
-			skips: client.skips,
-			lives: client.lives,
-            pvpTimerOrder: isHostTurn ? "host" : "guest"
-		});
-	} else {
-        enemy.sendAction({
-			action: "enemyInfo",
-			handsLeft,
-			score: null,
-			skips: client.skips,
-			lives: client.lives,
-            noScore: true,
-		});
-    }
-
-	// On our first hand of the blind, send the enemy's current state to us. If
-	// they have already played, this is the score that was withheld until now;
-	// if they haven't, it's their reset state (score 0, full hands) — enough for
-	// us to stop masking their hand count now that we've committed our own hand.
-	if (!hideScore || client.playedThisBlind) {
-		client.sendAction({
-			action: "enemyInfo",
-			handsLeft: enemy.handsLeft,
-			score: enemy.score.toString(),
-			skips: enemy.skips,
-			lives: enemy.lives,
-            pvpTimerOrder: isHostTurn ? "host" : "guest"
-		});
-	} else {
-        client.sendAction({
-			action: "enemyInfo",
-			handsLeft: enemy.handsLeft,
-			score: null,
-			skips: enemy.skips,
-			lives: enemy.lives,
-            noScore: true,
-		});
-    }
-
-	// This info is only sent on a boss blind, so it shouldn't
-	// affect other blinds
-	if (
-		(lobby.guest.handsLeft < 1 &&
-			lobby.guest.score.lessThan(lobby.host.score)) ||
-		(lobby.host.handsLeft < 1 &&
-			lobby.host.score.lessThan(lobby.guest.score)) ||
-		(lobby.host.handsLeft < 1 && lobby.guest.handsLeft < 1)
-	) {
-		const roundWinner = lobby.guest.score.lessThan(lobby.host.score)
-			? lobby.host
-			: lobby.guest;
-		const roundLoser =
-			roundWinner.id === lobby.host.id ? lobby.guest : lobby.host;
-
-		if (!lobby.host.score.equalTo(lobby.guest.score)) {
-			roundLoser.loseLife('round');
-
-			// If no lives are left, we end the game
-			if (lobby.host.lives <= 0 || lobby.guest.lives <= 0) {
-				const gameWinner =
-					lobby.host.lives > lobby.guest.lives ? lobby.host : lobby.guest;
-				const gameLoser =
-					gameWinner.id === lobby.host.id ? lobby.guest : lobby.host;
-
-				gameWinner?.sendAction({ action: "winGame" });
-				gameLoser?.sendAction({ action: "loseGame" });
-				roundWinner.firstReady = false;
-				roundLoser.firstReady = false;
-				return;
-			}
-		}
-
-		roundWinner.firstReady = false;
-		roundLoser.firstReady = false;
-		roundWinner.sendAction({ action: "endPvP", lost: false });
-		roundLoser.sendAction({
-			action: "endPvP",
-			lost: !lobby.guest.score.equalTo(lobby.host.score),
-		});
-	}
+	lobby.pruneTimers();
+	lobby.checkPvPRound();
 };
 
 const failPvPTimerAction = (
 	client: Client,
 ) => {
-    const lobby = client.lobby;
+	const lobby = client.lobby;
+	if (client.eliminated) return;
 
 	client.loseLife('timer');
 
 	if (!lobby) return;
 
-    if (client.lives === 0) {
-		let gameLoser = null;
-		let gameWinner = null;
-		if (client.id === lobby.host?.id) {
-			gameLoser = lobby.host;
-			gameWinner = lobby.guest;
-		} else {
-			gameLoser = lobby.guest;
-			gameWinner = lobby.host;
-		}
-
-		gameWinner?.sendAction({ action: "winGame" });
-		gameLoser?.sendAction({ action: "loseGame" });
-	} else {
-        let roundWinner: Client
-        let roundLoser: Client
-        if (client.id === lobby.host?.id) {
-            roundWinner = lobby.guest!;
-            roundLoser = lobby.host!;
-        } else {
-            roundWinner = lobby.host!;
-            roundLoser = lobby.guest!;
-        }
-        roundWinner.firstReady = false;
-		roundLoser.firstReady = false;
-		roundWinner.sendAction({
-            action: "endPvP",
-            lost: false,
-            pvpTimerLost: true
-        });
-		roundLoser.sendAction({
-			action: "endPvP",
-			lost: true,
-            pvpTimerLost: true
-		});
-    }
+	lobby.failPvPTimer(client);
 }
 
 const stopGameAction = (client: Client) => {
-	if (!client.lobby) {
+	const lobby = client.lobby;
+	if (!lobby) {
 		return;
 	}
-	client.lobby.broadcastAction({ action: "stopGame" });
-	client.lobby.resetPlayers();
+	// Leaving a game the others can finish only takes this player out of it
+	if (lobby.playsOnWithout()) {
+		lobby.eliminate(client, false);
+		client.sendAction({ action: "stopGame" });
+		return;
+	}
+	lobby.broadcastAction({ action: "stopGame" });
+	lobby.dropDisconnected();
+	lobby.resetPlayers();
 };
 
 // Deprecated
@@ -411,45 +290,19 @@ const lobbyOptionsAction = (
 };
 
 const failRoundAction = (client: Client) => {
-	const [lobby, enemy] = getEnemy(client);
-	if (!lobby || !enemy) return;
+	const lobby = client.lobby;
+	if (!lobby || lobby.getOpponents(client).length === 0) return;
+	if (client.eliminated) return;
 
 	if (lobby.options.death_on_round_loss) {
 		client.loseLife('round');
 	}
 
-	if (client.lives === 0) {
+	if (client.lives <= 0) {
 		if (lobby.gameMode === "survival") {
-			if (enemy.lives === 0) {
-				if (client.furthestBlind === enemy.furthestBlind) {
-					//Survival draw behavior, both players win by default
-					client.sendAction({ action: "winGame" });
-					enemy.sendAction({ action: "winGame" });
-				} else if (client.furthestBlind < enemy.furthestBlind) {
-					client.sendAction({ action: "loseGame" });
-					enemy.sendAction({ action: "winGame" });
-				}
-				//Otherwise do nothing
-			} else {
-				if (client.furthestBlind < enemy.furthestBlind) {
-					client.sendAction({ action: "loseGame" });
-					enemy.sendAction({ action: "winGame" });
-				}
-				//Otherwise do nothing
-			}
+			lobby.checkSurvival();
 		} else {
-			let gameLoser = null;
-			let gameWinner = null;
-			if (client.id === lobby.host?.id) {
-				gameLoser = lobby.host;
-				gameWinner = lobby.guest;
-			} else {
-				gameLoser = lobby.guest;
-				gameWinner = lobby.host;
-			}
-
-			gameWinner?.sendAction({ action: "winGame" });
-			gameLoser?.sendAction({ action: "loseGame" });
+			lobby.eliminate(client);
 		}
 	}
 };
@@ -510,44 +363,38 @@ const setFurthestBlindAction = (
 	{ furthestBlind }: ActionHandlerArgs<ActionSetFurthestBlind>,
 	client: Client,
 ) => {
-	const [lobby, enemy] = getEnemy(client);
+	const lobby = client.lobby;
 	client.furthestBlind = furthestBlind;
-	if (!lobby || !enemy) return;
+	if (!lobby || lobby.players.length < 2) return;
 
-	//If enemy died and client.furthestBlind is bigger, client wins
-	if (
-		lobby.gameMode === "survival" &&
-		enemy.lives === 0 &&
-		client.furthestBlind > enemy.furthestBlind
-	) {
-		client.sendAction({ action: "winGame" });
-		enemy.sendAction({ action: "loseGame" });
-	}
+	// A dead player loses once someone gets further
+	if (lobby.gameMode === "survival") lobby.checkSurvival();
 };
 
 const skipAction = (
 	{ skips }: ActionHandlerArgs<ActionSkip>,
 	client: Client,
 ) => {
-	const [lobby, enemy] = getEnemy(client);
+	const lobby = client.lobby;
+	if (client.eliminated) return;
+	if (lobby?.multi) {
+		for (let i = client.skips; i < skips; i++) client.shopSpends.push(0);
+	}
 	client.setSkips(skips);
-	if (!lobby || !enemy) return;
-	enemy.sendAction({
-		action: "enemyInfo",
-		handsLeft: client.handsLeft,
-		score: client.score.toString(),
-		skips: client.skips,
-		lives: client.lives,
-	});
+	if (!lobby || lobby.getOpponents(client).length === 0) return;
+	lobby.sendEnemyInfo(client);
+	lobby.sendShopSpends();
+	lobby.broadcastPlayersInfo();
 };
 
 const sendPhantomAction = (
 	{ key }: ActionHandlerArgs<ActionSendPhantom>,
 	client: Client,
 ) => {
-	const [lobby, enemy] = getEnemy(client);
-	if (!lobby || !enemy) return;
-	enemy.sendAction({
+	const lobby = client.lobby;
+	if (!lobby || client.eliminated) return;
+	client.phantoms.set(key, (client.phantoms.get(key) ?? 0) + 1);
+	lobby.relayToOpponents(client, {
 		action: "sendPhantom",
 		key,
 	});
@@ -557,26 +404,27 @@ const removePhantomAction = (
 	{ key }: ActionHandlerArgs<ActionRemovePhantom>,
 	client: Client,
 ) => {
-	const [lobby, enemy] = getEnemy(client);
-	if (!lobby || !enemy) return;
-	enemy.sendAction({
+	const lobby = client.lobby;
+	if (!lobby || client.eliminated) return;
+	const count = client.phantoms.get(key) ?? 0;
+	if (count > 1) client.phantoms.set(key, count - 1);
+	else client.phantoms.delete(key);
+	lobby.relayToOpponents(client, {
 		action: "removePhantom",
 		key,
 	});
 };
 
 const asteroidAction = (client: Client) => {
-	const [lobby, enemy] = getEnemy(client);
-	if (!lobby || !enemy) return;
-	enemy.sendAction({
+	if (client.eliminated) return;
+	client.lobby?.relayToOpponents(client, {
 		action: "asteroid",
 	});
 };
 
 const letsGoGamblingNemesisAction = (client: Client) => {
-	const [lobby, enemy] = getEnemy(client);
-	if (!lobby || !enemy) return;
-	enemy.sendAction({
+	if (client.eliminated) return;
+	client.lobby?.relayToOpponents(client, {
 		action: "letsGoGamblingNemesis",
 	});
 };
@@ -585,38 +433,53 @@ const eatPizzaAction = (
 	{ whole }: ActionHandlerArgs<ActionEatPizza>,
 	client: Client,
 ) => {
-	const [lobby, enemy] = getEnemy(client);
-	if (!lobby || !enemy) return;
-	enemy.sendAction({
+	if (client.eliminated) return;
+	client.lobby?.relayToOpponents(client, {
 		action: "eatPizza",
 		whole,
 	});
 };
 
+/** Taxes counts what the opponent sold; with several, their average */
 const soldJokerAction = (client: Client) => {
-	const [lobby, enemy] = getEnemy(client);
-	if (!lobby || !enemy) return;
-	enemy.sendAction({
-		action: "soldJoker",
-	});
+	const lobby = client.lobby;
+	if (!lobby || client.eliminated) return;
+	if (!lobby.multi) {
+		lobby.relayToOpponents(client, {
+			action: "soldJoker",
+		});
+		return;
+	}
+	client.sells++;
+	lobby.sendSells();
 };
 
+/** Penny Pincher reads the opponent's shop spends; with several, their average */
 const spentLastShopAction = (
 	{ amount }: ActionHandlerArgs<ActionSpentLastShop>,
 	client: Client,
 ) => {
-	const [lobby, enemy] = getEnemy(client);
-	if (!lobby || !enemy) return;
-	enemy.sendAction({
-		action: "spentLastShop",
-		amount,
-	});
+	const lobby = client.lobby;
+	if (!lobby || client.eliminated) return;
+	if (!lobby.multi) {
+		lobby.relayToOpponents(client, {
+			action: "spentLastShop",
+			amount,
+		});
+		return;
+	}
+	client.shopSpends.push(Number(amount) || 0);
+	lobby.sendShopSpends();
 };
 
+/** Magnet copies a joker from one opponent, picked at random when there are several */
 const magnetAction = (client: Client) => {
-	const [lobby, enemy] = getEnemy(client);
-	if (!lobby || !enemy) return;
-	enemy.sendAction({
+	const lobby = client.lobby;
+	if (!lobby || client.eliminated) return;
+	const opponents = lobby.getOpponents(client);
+	if (opponents.length === 0) return;
+	const target = opponents[Math.floor(Math.random() * opponents.length)];
+	lobby.requestFrom(target, client, "magnet", {
 		action: "magnet",
 	});
 };
@@ -625,18 +488,15 @@ const magnetResponseAction = (
 	{ key }: ActionHandlerArgs<ActionMagnetResponse>,
 	client: Client,
 ) => {
-	const [lobby, enemy] = getEnemy(client);
-	if (!lobby || !enemy) return;
-	enemy.sendAction({
+	client.lobby?.answerRequest(client, "magnet", {
 		action: "magnetResponse",
 		key,
 	});
 };
 
 const getEndGameJokersAction = (client: Client) => {
-	const [lobby, enemy] = getEnemy(client);
-	if (!lobby || !enemy) return;
-	enemy.sendAction({
+	const lobby = client.lobby;
+	lobby?.requestFrom(lobby.endGameTarget(client), client, "jokers", {
 		action: "getEndGameJokers",
 	});
 };
@@ -645,18 +505,15 @@ const receiveEndGameJokersAction = (
 	{ keys }: ActionHandlerArgs<ActionReceiveEndGameJokersRequest>,
 	client: Client,
 ) => {
-	const [lobby, enemy] = getEnemy(client);
-	if (!lobby || !enemy) return;
-	enemy.sendAction({
+	client.lobby?.answerRequest(client, "jokers", {
 		action: "receiveEndGameJokers",
 		keys,
 	});
 };
 
 const getNemesisDeckAction = (client: Client) => {
-	const [lobby, enemy] = getEnemy(client);
-	if (!lobby || !enemy) return;
-	enemy.sendAction({
+	const lobby = client.lobby;
+	lobby?.requestFrom(lobby.endGameTarget(client), client, "deck", {
 		action: "getNemesisDeck",
 	});
 };
@@ -665,18 +522,15 @@ const receiveNemesisDeckAction = (
 	{ cards }: ActionHandlerArgs<ActionReceiveNemesisDeckRequest>,
 	client: Client,
 ) => {
-	const [lobby, enemy] = getEnemy(client);
-	if (!lobby || !enemy) return;
-	enemy.sendAction({
+	client.lobby?.answerRequest(client, "deck", {
 		action: "receiveNemesisDeck",
 		cards,
 	});
 };
 
 const requestNemesisStatsActionHandler = (client: Client) => {
-	const [lobby, enemy] = getEnemy(client);
-	if (!lobby || !enemy) return;
-	enemy.sendAction({
+	const lobby = client.lobby;
+	lobby?.requestFrom(lobby.endGameTarget(client), client, "stats", {
 		action: "endGameStatsRequested",
 	});
 };
@@ -685,9 +539,7 @@ const receiveNemesisStatsActionHandler = (
 	stats: ActionHandlerArgs<ActionReceiveNemesisStatsRequest>,
 	client: Client,
 ) => {
-	const [lobby, enemy] = getEnemy(client);
-	if (!lobby || !enemy) return;
-	enemy.sendAction({
+	client.lobby?.answerRequest(client, "stats", {
 		action: "nemesisEndGameStats",
 		...stats,
 	});
@@ -697,47 +549,47 @@ const startAnteTimerAction = (
 	{ time, isPvP }: ActionHandlerArgs<ActionStartAnteTimer>,
 	client: Client,
 ) => {
-	const [lobby, enemy] = getEnemy(client);
-	if (!lobby || !enemy) return;
-	enemy.sendAction({
+	const lobby = client.lobby;
+	if (!lobby || client.eliminated) return;
+	const action: ActionServerToClient = {
 		action: "startAnteTimer",
 		time,
 		...(isPvP ? { isPvP: true } : {}),
-	});
+	};
+	if (lobby.multi) {
+		lobby.startTimer(client, action, Boolean(isPvP));
+	} else {
+		lobby.relayToOpponents(client, action);
+	}
 };
 
 const pauseAnteTimerAction = (
-	{ time }: ActionHandlerArgs<ActionPauseAnteTimer>,
+	{ time }: ActionHandlerArgs<ActionPauseAnteTimerRequest>,
 	client: Client,
 ) => {
-	const [lobby, enemy] = getEnemy(client);
-	if (!lobby || !enemy) return;
-	enemy.sendAction({
-		action: "pauseAnteTimer",
-		time,
-	});
+	const lobby = client.lobby;
+	if (!lobby || client.eliminated) return;
+	if (lobby.multi) {
+		lobby.pauseTimer(client, time);
+	} else {
+		lobby.relayToOpponents(client, {
+			action: "pauseAnteTimer",
+			time,
+		});
+	}
 };
 
 const failTimerAction = (client: Client) => {
 	const lobby = client.lobby;
+	if (client.eliminated) return;
 
 	client.loseLife('timer');
 
 	if (!lobby) return;
+	lobby.clearTimers(client);
 
-	if (client.lives === 0) {
-		let gameLoser = null;
-		let gameWinner = null;
-		if (client.id === lobby.host?.id) {
-			gameLoser = lobby.host;
-			gameWinner = lobby.guest;
-		} else {
-			gameLoser = lobby.guest;
-			gameWinner = lobby.host;
-		}
-
-		gameWinner?.sendAction({ action: "winGame" });
-		gameLoser?.sendAction({ action: "loseGame" });
+	if (client.lives <= 0) {
+		lobby.eliminate(client);
 	}
 };
 
@@ -870,19 +722,24 @@ const moddedAction = (
 	args: ActionHandlerArgs<ActionModdedRequest>,
 	client: Client,
 ) => {
-	const [lobby, enemy] = getEnemy(client);
-	if (!lobby || !enemy) return;
+	const lobby = client.lobby;
+	if (!lobby || lobby.players.length < 2) return;
 
 	const target = args.target as string | undefined;
 	const { target: _, ...rest } = args;
 	const from = lobby.host?.id === client.id ? "host" : "guest";
-	const message = { action: "moddedAction" as const, from, ...rest } as ActionModded;
+	const message = {
+		action: "moddedAction" as const,
+		from,
+		...(lobby.multi ? { fromId: client.playerId } : {}),
+		...rest,
+	} as ActionModded;
 	const relayTarget = target ?? "nemesis";
 
 	if (relayTarget === "all") {
 		lobby.broadcastAction(message);
 	} else {
-		enemy.sendAction(message);
+		lobby.relayToOpponents(client, message);
 	}
 };
 
@@ -957,13 +814,8 @@ const dataSyncAction = (
     { timer }: ActionHandlerArgs<ActionDataSyncRequest>,
     client: Client,
  ) => {
-	const [lobby, enemy] = getEnemy(client);
-    if (!lobby || !enemy) return
-
-    enemy.sendAction({
-        action: "dataSync",
-        timer: Number.isNaN(timer) ? undefined : Number(timer)
-    })
+    if (client.eliminated) return
+    client.lobby?.sendTimers(client, Number.isNaN(timer) ? undefined : Number(timer))
 }
 
 export const actionHandlers = {

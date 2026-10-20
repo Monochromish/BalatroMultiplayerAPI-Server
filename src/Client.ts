@@ -58,6 +58,40 @@ class Client {
 
 	isCached = true
 
+	/** Lobby seat number, stable across reconnects (lobbyInfo/playersInfo `id`) */
+	playerId = 0
+	/** Largest lobby the mod can show, from the username action. Mods without
+	 *  multi-player lobbies don't send it. */
+	maxPlayers = 2
+	connected = true
+	eliminated = false
+	/** Finishing place once eliminated or won, 0 while still playing */
+	place = 0
+	readyAt = 0
+	/** Started the current PvP blind */
+	inPvP = false
+	/** Finished the current PvP blind early by running out the PvP timer */
+	pvpResolved = false
+	/** playerIds currently running this player's timer (multi-player only) */
+	timeredBy = new Set<number>()
+	/** Phantom jokers this player has on opponents' boards, by key */
+	phantoms = new Map<string, number>()
+	sells = 0
+	soldTicksSent = 0
+	/** Shop spends in order, with a 0 per skipped blind (multi-player only) */
+	shopSpends: number[] = []
+	shopSpendsSent = 0
+	/** Highest opponent skip count shown to this player this game */
+	skipsShown = 0
+	/** Last timer value from dataSync */
+	lastTimer: number | undefined = undefined
+	pendingRequests: Record<'jokers' | 'deck' | 'stats' | 'magnet', Client[]> = {
+		jokers: [],
+		deck: [],
+		stats: [],
+		magnet: [],
+	}
+
 	constructor(
 		address: Address,
 		send: SendFn,
@@ -74,13 +108,7 @@ class Client {
 
 	setLocation = (location: string) => {
 		this.location = location
-		if (this.lobby) {
-			if (this.lobby.host === this) {
-				this.lobby.guest?.sendAction({ action: "enemyLocation", location: this.location })
-			} else {
-				this.lobby.host?.sendAction({ action: "enemyLocation", location: this.location })
-			}
-		}
+		this.lobby?.sendEnemyLocations(this)
 	}
 
 	setUsername = (username: string) => {
@@ -121,16 +149,7 @@ class Client {
 			this.roundLivesBlocker = true
 		}
 		this.sendAction({ action: "playerInfo", lives: this.lives });
-		if (this.lobby && this.lobby.host && this.lobby.guest) {
-			const enemy = this.lobby.host === this ? this.lobby.guest : this.lobby.host
-			enemy.sendAction({
-				action: "enemyInfo",
-				handsLeft: this.handsLeft,
-				score: this.score.toString(),
-				skips: this.skips,
-				lives: this.lives,
-			});
-		}
+		this.lobby?.sendEnemyInfo(this)
 	}
 
 	setSkips = (skips: number) => {

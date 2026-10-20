@@ -4,7 +4,8 @@
 		"build-servers": "node build.js",
 		"build": "tsc",
 		"dev": "tsx watch src/main.ts",
-		"start": "node ./dist/main.js"
+		"start": "node ./dist/main.js",
+		"test": "node --import tsx --test test/*.test.ts"
 	},
 	"dependencies": {
 		"better-sqlite3": "^12.10.0",

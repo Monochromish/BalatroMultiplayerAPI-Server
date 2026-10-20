@@ -5,6 +5,18 @@ export type ActionJoinedLobby = { action: 'joinedLobby'; code: string; type: Gam
 export type ActionRejoinedLobby = { action: 'rejoinedLobby'; code: string; type: GameMode; reconnectToken: string }
 export type ActionEnemyDisconnected = { action: 'enemyDisconnected'; timeout: number }
 export type ActionEnemyReconnected = { action: 'enemyReconnected' }
+/** A player dropped from a game that carries on without waiting for them */
+export type ActionPlayerDisconnected = { action: 'playerDisconnected'; id: number; timeout: number }
+export type ActionPlayerReconnected = { action: 'playerReconnected'; id: number }
+export type ActionLobbyPlayer = {
+	id: number
+	username: string
+	modHash: string
+	cached: boolean
+	ready: boolean
+	isHost: boolean
+	connected: boolean
+}
 export type ActionLobbyInfo = {
 	action: 'lobbyInfo'
 	host: string
@@ -15,6 +27,25 @@ export type ActionLobbyInfo = {
 	guestCached?: boolean
 	guestReady?: boolean
 	isHost: boolean
+	players?: ActionLobbyPlayer[]
+	maxPlayers?: number
+	selfId?: number
+}
+/** Every player's state, sent in games that started with more than two players */
+export type ActionPlayersInfo = {
+	action: 'playersInfo'
+	players: {
+		id: number
+		alive: boolean
+		place: number
+		lives: number
+		score: string | null
+		handsLeft: number
+		skips: number
+		location: string
+		ready: boolean
+		connected: boolean
+	}[]
 }
 export type ActionStopGame = { action: 'stopGame' }
 export type ActionStartGame = {
@@ -22,6 +53,7 @@ export type ActionStartGame = {
 	deck: string
 	stake?: number
 	seed?: string
+	playerCount?: number
 }
 export type ActionStartBlind = { action: 'startBlind', firstPlayer?: "host" | "guest" }
 export type ActionWinGame = { action: 'winGame' }
@@ -70,7 +102,7 @@ export type ActionReceiveNemesisDeckRequest = { action: 'receiveNemesisDeck', ca
 export type ActionGetNemesisStatsRequest = { action: 'endGameStatsRequested' }
 export type ActionReceiveNemesisStatsRequest = { action: 'nemesisEndGameStats', reroll_count: string, reroll_cost_total:string, vouchers:string }
 export type ActionStartAnteTimer = { action: 'startAnteTimer', time: number, isPvP?: boolean }
-export type ActionPauseAnteTimer = { action: 'pauseAnteTimer', time: number }
+export type ActionPauseAnteTimer = { action: 'pauseAnteTimer', time?: number }
 export type ActionDataSyncResponse = { action: "dataSync", timer?: number }
 // Handy Actions (Server to Client)
 export type ActionHandyMPExtensionLobbyEnabled = { action: 'handyMPExtensionLobbyEnabled', enabled: boolean }
@@ -80,7 +112,7 @@ export type ActionTcgStartGame = { action: 'tcgStartGame', damage: number, start
 export type ActionTcgPlayerStatus = { action: 'tcgPlayerStatus', [key: string]: unknown }
 export type ActionTcgStartTurn = { action: 'tcgStartTurn', [key: string]: unknown }
 // Modded Actions
-export type ActionModded = { action: 'moddedAction', modId: string, modAction: string, from: 'host' | 'guest', target?: 'nemesis' | 'all', [key: string]: unknown }
+export type ActionModded = { action: 'moddedAction', modId: string, modAction: string, from: 'host' | 'guest', fromId?: number, target?: 'nemesis' | 'all', [key: string]: unknown }
 export type ActionServerToClient =
 	| ActionConnected
 	| ActionError
@@ -88,7 +120,10 @@ export type ActionServerToClient =
 	| ActionRejoinedLobby
 	| ActionEnemyDisconnected
 	| ActionEnemyReconnected
+	| ActionPlayerDisconnected
+	| ActionPlayerReconnected
 	| ActionLobbyInfo
+	| ActionPlayersInfo
 	| ActionStopGame
 	| ActionStartGame
 	| ActionStartBlind
@@ -128,7 +163,7 @@ export type ActionServerToClient =
     | ActionDataSyncResponse
     | ActionHandyMPExtensionLobbyEnabled
 // Client to Server
-export type ActionUsername = { action: 'username'; username: string; modHash: string }
+export type ActionUsername = { action: 'username'; username: string; modHash: string; maxPlayers?: number }
 export type ActionCreateLobby = { action: 'createLobby'; gameMode: GameMode }
 export type ActionJoinLobby = { action: 'joinLobby'; code: string }
 export type ActionLeaveLobby = { action: 'leaveLobby' }
